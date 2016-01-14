@@ -126,8 +126,12 @@ typedef struct
     AVCaptureAudioDataOutput *audio_output;
     CMSampleBufferRef         current_frame;
     CMSampleBufferRef         current_audio_frame;
+    AVFormatContext          *avformatContext;
+#if TARGET_OS_IPHONE
+    AVCaptureVideoPreviewLayer *capture_previewLayer;
+#endif
 } AVFContext;
-
+static int configure_video_device(AVFormatContext *s, AVCaptureDevice *video_device);
 static void lock_frames(AVFContext* ctx)
 {
     pthread_mutex_lock(&ctx->frame_lock);
@@ -159,6 +163,9 @@ static void unlock_frames(AVFContext* ctx)
 {
     if (self = [super init]) {
         _context = context;
+#if TARGET_OS_IPHONE
+        [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(switchCamera:) name:@"FFmpegAVFoundationSwitchCamera" object:nil];
+#endif
     }
     return self;
 }
@@ -181,7 +188,73 @@ static void unlock_frames(AVFContext* ctx)
 
     ++_context->frames_captured;
 }
+#if TARGET_OS_IPHONE
+- (int)switchCamera:(NSNotification *)aNotification
+{
+    int ret = 0;
+    AVCaptureSession *captureSession = _context->capture_session;
+    //Change camera source
+    if(captureSession)
+    {
+        //Indicate that some changes will be made to the session
+        [captureSession beginConfiguration];
 
+        //Remove existing video input
+        AVCaptureInput* currentCameraInput = nil;
+        for (AVCaptureDeviceInput *deviceInput in captureSession.inputs) {
+            if ([deviceInput.device hasMediaType:AVMediaTypeVideo]) {
+                currentCameraInput = deviceInput;
+                break;
+            }
+        }
+        [captureSession removeInput:currentCameraInput];
+
+        //Get new input
+        AVCaptureDevice *newCamera = nil;
+        if(((AVCaptureDeviceInput*)currentCameraInput).device.position == AVCaptureDevicePositionBack)
+        {
+            newCamera = [self cameraWithPosition:AVCaptureDevicePositionFront];
+        }
+        else
+        {
+            newCamera = [self cameraWithPosition:AVCaptureDevicePositionBack];
+        }
+        //Add input to session
+        AVCaptureDeviceInput *newVideoInput = [[AVCaptureDeviceInput alloc] initWithDevice:newCamera error:nil];
+        [captureSession addInput:newVideoInput];
+
+        // Configure device framerate and video size
+        AVFormatContext *s = _context->avformatContext;
+        @try {
+            if ((ret = configure_video_device(s, newCamera)) < 0) {
+                return ret;
+            }
+        } @catch (NSException *exception) {
+            if (![[exception name] isEqualToString:NSUndefinedKeyException]) {
+                av_log (s, AV_LOG_ERROR, "An error occurred: %s", [exception.reason UTF8String]);
+                return AVERROR_EXTERNAL;
+            }
+        }
+        //Commit all the configuration changes at once
+        [captureSession commitConfiguration];
+    }
+}
+// Find a camera with the specified AVCaptureDevicePosition, returning nil if one is not found
+- (AVCaptureDevice *)cameraWithPosition:(AVCaptureDevicePosition) position
+{
+    NSArray *devices = [AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo];
+    for (AVCaptureDevice *device in devices)
+    {
+        if ([device position] == position) return device;
+    }
+    return nil;
+}
+- (void)dealloc
+{
+    [[NSNotificationCenter defaultCenter]removeObserver:self];
+    [super dealloc];
+}
+#endif
 @end
 
 /** AudioReciever class - delegate for AVCaptureSession
@@ -239,7 +312,12 @@ static void destroy_context(AVFContext* ctx)
     [ctx->audio_output    release];
     [ctx->avf_delegate    release];
     [ctx->avf_audio_delegate release];
-
+#if TARGET_OS_IPHONE
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"kFFMPEG_CAPTURE_PREVIEWLAYER" object:nil];
+    [ctx->capture_previewLayer release];
+    ctx->capture_previewLayer = NULL;
+#endif
+    ctx->avformatContext = NULL;
     ctx->capture_session = NULL;
     ctx->video_output    = NULL;
     ctx->audio_output    = NULL;
@@ -289,7 +367,13 @@ static int configure_video_device(AVFormatContext *s, AVCaptureDevice *video_dev
     NSObject *format = nil;
     NSObject *selected_range = nil;
     NSObject *selected_format = nil;
-
+#if TARGET_OS_IPHONE
+    if (video_device.position == AVCaptureDevicePositionBack) {
+        framerate = 30.0f;
+    }else {
+        framerate = 60.f;
+    }
+#endif
     for (format in [video_device valueForKey:@"formats"]) {
         CMFormatDescriptionRef formatDescription;
         CMVideoDimensions dimensions;
@@ -369,10 +453,6 @@ static int add_video_device(AVFormatContext *s, AVCaptureDevice *video_device)
     int ret;
     NSError *error  = nil;
     AVCaptureInput* capture_input = nil;
-    struct AVFPixelFormatSpec pxl_fmt_spec;
-    NSNumber *pixel_format;
-    NSDictionary *capture_dict;
-    dispatch_queue_t queue;
 
     if (ctx->video_device_index < ctx->num_video_devices) {
         capture_input = (AVCaptureInput*) [[[AVCaptureDeviceInput alloc] initWithDevice:video_device error:&error] autorelease];
@@ -393,14 +473,6 @@ static int add_video_device(AVFormatContext *s, AVCaptureDevice *video_device)
         return 1;
     }
 
-    // Attaching output
-    ctx->video_output = [[AVCaptureVideoDataOutput alloc] init];
-
-    if (!ctx->video_output) {
-        av_log(s, AV_LOG_ERROR, "Failed to init AV video output\n");
-        return 1;
-    }
-
     // Configure device framerate and video size
     @try {
         if ((ret = configure_video_device(s, video_device)) < 0) {
@@ -408,9 +480,25 @@ static int add_video_device(AVFormatContext *s, AVCaptureDevice *video_device)
         }
     } @catch (NSException *exception) {
         if (![[exception name] isEqualToString:NSUndefinedKeyException]) {
-          av_log (s, AV_LOG_ERROR, "An error occurred: %s", [exception.reason UTF8String]);
-          return AVERROR_EXTERNAL;
+            av_log (s, AV_LOG_ERROR, "An error occurred: %s", [exception.reason UTF8String]);
+            return AVERROR_EXTERNAL;
         }
+    }
+    return 0;
+}
+static int add_video_output(AVFormatContext *s)
+{
+    AVFContext *ctx = (AVFContext*)s->priv_data;
+    struct AVFPixelFormatSpec pxl_fmt_spec;
+    NSNumber *pixel_format;
+    NSDictionary *capture_dict;
+    dispatch_queue_t queue;
+    // Attaching output
+    ctx->video_output = [[AVCaptureVideoDataOutput alloc] init];
+
+    if (!ctx->video_output) {
+        av_log(s, AV_LOG_ERROR, "Failed to init AV video output\n");
+        return 1;
     }
 
     // select pixel format
@@ -496,7 +584,6 @@ static int add_audio_device(AVFormatContext *s, AVCaptureDevice *audio_device)
     AVFContext *ctx = (AVFContext*)s->priv_data;
     NSError *error  = nil;
     AVCaptureDeviceInput* audio_dev_input = [[[AVCaptureDeviceInput alloc] initWithDevice:audio_device error:&error] autorelease];
-    dispatch_queue_t queue;
 
     if (!audio_dev_input) {
         av_log(s, AV_LOG_ERROR, "Failed to create AV capture input device: %s\n",
@@ -510,7 +597,12 @@ static int add_audio_device(AVFormatContext *s, AVCaptureDevice *audio_device)
         av_log(s, AV_LOG_ERROR, "can't add audio input to capture session\n");
         return 1;
     }
-
+    return 0;
+}
+static int add_audio_output(AVFormatContext *s)
+{
+    AVFContext *ctx = (AVFContext*)s->priv_data;
+    dispatch_queue_t queue;
     // Attaching output
     ctx->audio_output = [[AVCaptureAudioDataOutput alloc] init];
 
@@ -665,6 +757,7 @@ static int avf_read_header(AVFormatContext *s)
     int capture_screen      = 0;
     uint32_t num_screens    = 0;
     AVFContext *ctx         = (AVFContext*)s->priv_data;
+    ctx->avformatContext    = s;
     AVCaptureDevice *video_device = nil;
     AVCaptureDevice *audio_device = nil;
     // Find capture device
@@ -859,6 +952,11 @@ static int avf_read_header(AVFormatContext *s)
 
     // Initialize capture session
     ctx->capture_session = [[AVCaptureSession alloc] init];
+#if TARGET_OS_IPHONE
+    [ctx->capture_previewLayer removeFromSuperlayer];
+    ctx->capture_previewLayer = [[AVCaptureVideoPreviewLayer alloc] initWithSession:ctx->capture_session];
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"kFFMPEG_CAPTURE_PREVIEWLAYER" object:ctx->capture_previewLayer];
+#endif
 
     if (video_device && add_video_device(s, video_device)) {
         goto fail;
@@ -866,6 +964,8 @@ static int avf_read_header(AVFormatContext *s)
     if (audio_device && add_audio_device(s, audio_device)) {
     }
 
+    add_video_output(s);
+    add_audio_output(s);
     [ctx->capture_session startRunning];
 
     /* Unlock device configuration only after the session is started so it
